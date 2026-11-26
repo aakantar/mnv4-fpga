@@ -115,17 +115,45 @@ def quantize_weights(model, bits=8):
     return scales
 
 
+def _clip_threshold(M, hist, method, qmax, nbins, percentile=99.99):
+    """|x| histogramından (aralık [0, M]) kırpma eşiği T'yi seç."""
+    M = M if M > 0 else 1e-8
+    if method == "max" or hist is None:
+        return M
+    h = hist.double().cpu()
+    centers = (torch.arange(nbins, dtype=torch.float64) + 0.5) * M / nbins
+    if method == "percentile":
+        c = torch.cumsum(h, 0) / h.sum().clamp(min=1)
+        idx = int(torch.searchsorted(c, torch.tensor(percentile / 100.0, dtype=torch.float64)))
+        return float(centers[min(idx, nbins - 1)]) + 0.5 * M / nbins
+    if method == "mse":
+        # Kırpma + yuvarlama hatasının beklenen karesini histogramdan hesapla, en küçüğünü seç
+        best, T = None, M
+        for frac in torch.linspace(0.2, 1.0, 161, dtype=torch.float64):
+            t = float(frac) * M
+            s = t / qmax
+            q = torch.clamp(torch.round(centers / s), 0, qmax) * s
+            err = float((h * (centers - q) ** 2).sum())
+            if best is None or err < best:
+                best, T = err, t
+        return T
+    raise ValueError(method)
+
+
 class ActQuantizer:
     """Bir aktivasyon tensörü için gözlemci + sahte nicemleyici.
-    mode: 'off' (dokunma), 'max' (en büyük |x|'i bul), 'hist' (histogram topla), 'quant' (nicemle)"""
+    mode: 'off' (dokunma), 'max' (en büyük |x|'i bul), 'hist' (histogram topla), 'quant' (nicemle)
+    per_channel=True: her kanal için ayrı ölçek (yalnızca tüketicisi depthwise olan tensörler için;
+    donanımda ölçek, tüketen katmanın kanal başına çarpanına gömülür)."""
     NBINS = 2048
 
-    def __init__(self, name, unsigned=False, bits=8, is_relu=False):
+    def __init__(self, name, unsigned=False, bits=8, is_relu=False, per_channel=False):
         self.name, self.bits, self.is_relu = name, bits, is_relu
+        self.per_channel = per_channel
         self.set_unsigned(unsigned)
         self.mode = "off"
-        self.absmax = 0.0
-        self.hist = None
+        self.absmax = None   # tensör başına: float, kanal başına: [C] tensörü
+        self.hist = None     # tensör başına: [NBINS], kanal başına: [C, NBINS]
         self.scale = None
 
     def set_bits(self, bits):
@@ -137,16 +165,34 @@ class ActQuantizer:
         self.qmin = 0 if unsigned else -(2 ** (self.bits - 1))
         self.qmax = 2 ** self.bits - 1 if unsigned else 2 ** (self.bits - 1) - 1
 
+    def set_per_channel(self, flag):
+        """Kalibrasyondan ÖNCE çağrılmalı (istatistikler sıfırlanır)."""
+        self.per_channel = flag
+        self.absmax, self.hist, self.scale = None, None, None
+
     def __call__(self, x):
         if self.mode == "max":
-            self.absmax = max(self.absmax, x.detach().abs().max().item())
+            xa = x.detach().abs()
+            if self.per_channel:
+                m = xa.amax(dim=(0, 2, 3)).float()
+                self.absmax = m if self.absmax is None else torch.maximum(self.absmax, m)
+            else:
+                m = xa.max().item()
+                self.absmax = m if self.absmax is None else max(self.absmax, m)
         elif self.mode == "hist":
-            h = torch.histc(x.detach().abs().float(), bins=self.NBINS, min=0, max=self.absmax)
+            xa = x.detach().abs().float()
+            if self.per_channel:
+                h = torch.stack([torch.histc(xa[:, c], bins=self.NBINS, min=0,
+                                             max=max(float(self.absmax[c]), 1e-8))
+                                 for c in range(xa.shape[1])])
+            else:
+                h = torch.histc(xa, bins=self.NBINS, min=0, max=max(self.absmax, 1e-8))
             self.hist = h if self.hist is None else self.hist + h
         elif self.mode == "quant":
             if self.unsigned and x.min() < 0:
                 raise RuntimeError(f"{self.name}: işaretsiz seçildi ama negatif değer var")
-            return torch.clamp(torch.round(x / self.scale), self.qmin, self.qmax) * self.scale
+            s = self.scale.view(1, -1, 1, 1) if self.per_channel else self.scale
+            return torch.clamp(torch.round(x / s), self.qmin, self.qmax) * s
         return x
 
     def choose_scale(self, method, percentile=99.99):
@@ -154,29 +200,15 @@ class ActQuantizer:
         method: 'max', 'mse', 'percentile' ya da 'p99.9' gibi doğrudan yüzdelik."""
         if method.startswith("p") and method != "percentile":
             method, percentile = "percentile", float(method[1:])
-        M = self.absmax if self.absmax > 0 else 1e-8
-        if method == "max" or self.hist is None:
-            T = M
+        if self.per_channel:
+            T = [_clip_threshold(float(self.absmax[c]),
+                                 None if self.hist is None else self.hist[c],
+                                 method, self.qmax, self.NBINS, percentile)
+                 for c in range(len(self.absmax))]
+            self.scale = torch.tensor(T, device=self.absmax.device) / self.qmax
         else:
-            h = self.hist.double().cpu()
-            centers = (torch.arange(self.NBINS, dtype=torch.float64) + 0.5) * M / self.NBINS
-            if method == "percentile":
-                c = torch.cumsum(h, 0) / h.sum()
-                idx = int(torch.searchsorted(c, torch.tensor(percentile / 100.0, dtype=torch.float64)))
-                T = float(centers[min(idx, self.NBINS - 1)]) + 0.5 * M / self.NBINS
-            elif method == "mse":
-                # Kırpma + yuvarlama hatasının beklenen karesini histogramdan hesapla, en küçüğünü seç
-                best, T = None, M
-                for frac in torch.linspace(0.2, 1.0, 161, dtype=torch.float64):
-                    t = float(frac) * M
-                    s = t / self.qmax
-                    q = torch.clamp(torch.round(centers / s), 0, self.qmax) * s
-                    err = float((h * (centers - q) ** 2).sum())
-                    if best is None or err < best:
-                        best, T = err, t
-            else:
-                raise ValueError(method)
-        self.scale = T / self.qmax
+            M = self.absmax if self.absmax is not None else 0.0
+            self.scale = _clip_threshold(M, self.hist, method, self.qmax, self.NBINS, percentile) / self.qmax
         return self.scale
 
 

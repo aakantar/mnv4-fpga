@@ -115,6 +115,8 @@ def main():
                    help="Residual toplamayı akümülatörde yap (pw_proj çıkışı ayrıca nicemlenmez)")
     p.add_argument("--int16", nargs="*", default=[],
                    help="16 bit tutulacak nicemleme noktaları, ör. blocks.2.5.add")
+    p.add_argument("--per-channel", nargs="*", default=[],
+                   help="Kanal başına ölçeklenecek noktalar (tüketicisi depthwise olmalı), ör. blocks.2.5.add")
     p.add_argument("--global-method", default=None,
                    help="Verilirse A bölümü atlanır, bu yöntem kullanılır (ör. p99.99)")
     p.add_argument("--relu-unsigned", action="store_true",
@@ -136,9 +138,14 @@ def main():
         if n not in qs:
             raise SystemExit(f"--int16: '{n}' adında nicemleme noktası yok")
         qs[n].set_bits(16)
+    for n in args.per_channel:
+        if n not in qs:
+            raise SystemExit(f"--per-channel: '{n}' adında nicemleme noktası yok")
+        qs[n].set_per_channel(True)
     names = list(qs)
     print(f"Nicemleme noktası: {len(qs)} | residual akümülatörde: {'evet' if args.fuse_add else 'hayır'}"
-          f" | 16 bit: {args.int16 if args.int16 else 'yok'}")
+          f" | 16 bit: {args.int16 if args.int16 else 'yok'}"
+          f" | kanal başına: {args.per_channel if args.per_channel else 'yok'}")
 
     tf = create_transform(input_size=(3, 224, 224), is_training=False,
                           interpolation=cfg["interpolation"], mean=cfg["mean"],
@@ -229,10 +236,11 @@ def main():
     apply_methods(qs, methods)
     torch.save(dict(
         method="per-tensor", methods=methods, relu_unsigned=uns, bits=8,
-        fuse_add=args.fuse_add, int16=list(args.int16),
+        fuse_add=args.fuse_add, int16=list(args.int16), per_channel=list(args.per_channel),
         act_bits={n: q.bits for n, q in qs.items()},
         act_scales={n: q.scale for n, q in qs.items()},
         act_absmax={n: q.absmax for n, q in qs.items()},
+        act_per_channel={n: q.per_channel for n, q in qs.items()},
         act_unsigned={n: q.unsigned for n, q in qs.items()},
         weight_scales={k: v.cpu() for k, v in w_scales.items()},
         sensitivity_db=gains,
