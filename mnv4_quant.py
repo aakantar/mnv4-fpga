@@ -9,6 +9,7 @@ import copy
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 MODEL_NAME = "mobilenetv4_conv_small.e2400_r224_in1k"
 
@@ -270,3 +271,184 @@ def calibrate(model, quantizers, loader, device):
 
 def choose_scales(quantizers, method, percentile=99.99):
     return {n: q.choose_scale(method, percentile) for n, q in quantizers.items()}
+
+
+# =====================================================================
+# Adım 3: Yalnızca tamsayı aritmetiğiyle çalışan model (donanımın birebir taklidi)
+#
+# Her gövde katmanı için:
+#   acc[c] = sum(W_q * x_q) + b_q[c]                      (W: INT8, x: UINT8/INT8/INT16, acc: INT32)
+#   y[c]   = clamp((acc*m[c] + x_sc*m2[c] + 2^(sh[c]-1)) >> sh[c], qmin, qmax)
+#            (x_sc*m2 terimi yalnızca residual bloklarda; ReLU = qmin 0 ile kırpma)
+#   m2[c]  = m2_mant[c] << m2_lshift[c]   (m2_mant de MBITS bit: donanımda küçük çarpıcı + kaydırıcı)
+#   m: MBITS bitlik pozitif tamsayı, [2^(MBITS-1), 2^MBITS) aralığında
+#   >> : aritmetik sağa kaydırma (aşağı yuvarlar) -> +2^(sh-1) ile "yarımı yukarı" yuvarlama
+# Konvolüsyonlar float64'te tamsayı değerlerle hesaplanır ve yuvarlanır: |acc| << 2^53 olduğu için kesin.
+# =====================================================================
+
+MBITS = 15
+
+
+def quantize_multiplier(M, mbits=MBITS):
+    """Gerçel çarpan(lar) M -> (m, sh) öyle ki M ~= m * 2^-sh, m in [2^(mbits-1), 2^mbits)."""
+    M = torch.as_tensor(M, dtype=torch.float64)
+    if (M <= 0).any():
+        raise ValueError("çarpan pozitif olmalı")
+    e = torch.floor(torch.log2(M))
+    sh = (mbits - 1 - e).to(torch.int64)
+    m = torch.round(M * torch.pow(2.0, sh.double())).to(torch.int64)
+    over = m >= (1 << mbits)            # yuvarlama taşırdıysa bir bit geri al
+    m = torch.where(over, m // 2, m)
+    sh = torch.where(over, sh - 1, sh)
+    if (sh < 1).any():
+        raise ValueError("kaydırma 1'den küçük çıktı (çarpan çok büyük)")
+    return m, sh
+
+
+def _qrange(bits, unsigned):
+    return (0, 2 ** bits - 1) if unsigned else (-(2 ** (bits - 1)), 2 ** (bits - 1) - 1)
+
+
+def _load_calib(path):
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+class IntModel(nn.Module):
+    """Gömülmüş (fold_bn) model + Adım 2 kalibrasyon dosyası -> tamsayı model.
+    forward(x_float_normalize) -> logits (gövde tamsayı, baş float).
+    self.layers: donanıma aktarılacak katman parametreleri (sırasıyla)."""
+
+    def __init__(self, folded, calib):
+        super().__init__()
+        self.head_model = folded           # yalnızca forward_head için (ARM tarafı)
+        cal = _load_calib(calib) if isinstance(calib, str) else calib
+        if not cal.get("fuse_add", False):
+            raise ValueError("Bu tamsayı model 'fuse_add=True' ile kalibre edilmiş dosya bekler")
+        self.cal = cal
+        sc, uns = cal["act_scales"], cal["act_unsigned"]
+        bits = cal.get("act_bits", {n: 8 for n in sc})
+
+        def tensor_info(name):
+            s = sc[name]
+            s = s.double().cpu() if torch.is_tensor(s) else torch.tensor(float(s), dtype=torch.float64)
+            qmin, qmax = _qrange(bits[name], uns[name])
+            return dict(name=name, scale=s, qmin=qmin, qmax=qmax, bits=bits[name], unsigned=uns[name])
+
+        self.input_info = tensor_info("input")
+        layers = []
+        cur = self.input_info
+
+        def add_layer(conv, out_name, conv_name, block, role, skip_src=None):
+            nonlocal cur
+            w = conv.weight.detach().double().cpu()
+            b = conv.bias.detach().double().cpu()
+            cout = w.shape[0]
+            depthwise = conv.groups == conv.in_channels and conv.groups > 1
+            s_in = cur["scale"]
+            if s_in.numel() > 1 and not depthwise:
+                raise NotImplementedError(f"{conv_name}: kanal başına giriş ölçeği yalnızca depthwise için")
+            s_w = w.abs().amax(dim=(1, 2, 3)).clamp(min=1e-12) / QMAX_W
+            w_q = torch.clamp(torch.round(w / s_w.view(-1, 1, 1, 1)), -QMAX_W, QMAX_W)
+            s_acc = s_in * s_w if s_in.numel() == 1 else s_in.view(-1) * s_w
+            b_q = torch.round(b / s_acc)
+            out = tensor_info(out_name)
+            m, sh = quantize_multiplier(s_acc / out["scale"])
+            m2 = m2_mant = m2_lshift = None
+            if skip_src is not None:
+                # Kısayol çarpanı da 15 bitlik çarpan + sola kaydırma: m2 = m2_mant << (sh - sh2)
+                m2_mant, sh2 = quantize_multiplier((skip_src["scale"] / out["scale"]).expand(cout))
+                m2_lshift = sh - sh2
+                if (m2_lshift < 0).any():
+                    raise ValueError(f"{conv_name}: kısayol kaydırması negatif")
+                m2 = torch.bitwise_left_shift(m2_mant, m2_lshift)
+            if b_q.abs().max() >= 2 ** 31:
+                raise OverflowError(f"{conv_name}: bias INT32'ye sığmıyor")
+            layers.append(dict(
+                index=len(layers) + 1, block=block, role=role, conv_name=conv_name,
+                in_tensor=cur["name"], out_tensor=out_name,
+                skip_tensor=None if skip_src is None else skip_src["name"],
+                cin=conv.in_channels, cout=cout, kernel=conv.kernel_size[0], stride=conv.stride[0],
+                padding=conv.padding[0], groups=conv.groups, depthwise=depthwise,
+                in_bits=cur["bits"], in_unsigned=cur["unsigned"],
+                out_bits=out["bits"], out_unsigned=out["unsigned"], qmin=out["qmin"], qmax=out["qmax"],
+                w_q=w_q.to(torch.int8), b_q=b_q.to(torch.int64), m=m, sh=sh, m2=m2,
+                m2_mant=m2_mant, m2_lshift=m2_lshift,
+                s_in=s_in, s_w=s_w, s_out=out["scale"],
+            ))
+            cur = out
+
+        # Stem
+        add_layer(folded.conv_stem, "bn1", "conv_stem", "stem", "stem")
+        for si, stage in enumerate(folded.blocks):
+            for bi, blk in enumerate(stage):
+                pre = f"blocks.{si}.{bi}"
+                if hasattr(blk, "pw_exp"):
+                    shortcut = cur
+                    for role in ("dw_start", "pw_exp", "dw_mid", "pw_proj"):
+                        sub = getattr(blk, role)
+                        if isinstance(sub, nn.Identity):
+                            continue
+                        last = role == "pw_proj"
+                        skip = last and blk.has_skip
+                        out_name = f"{pre}.add" if skip else f"{pre}.{role}.bn"
+                        add_layer(sub.conv, out_name, f"{pre}.{role}.conv", pre, role,
+                                  skip_src=shortcut if skip else None)
+                else:
+                    add_layer(blk.conv, f"{pre}.bn1", f"{pre}.conv", pre, "conv")
+        self.layers = layers
+        self.out_info = cur
+
+    def quantize_input(self, x):
+        s = self.input_info["scale"].to(x.device)
+        return torch.clamp(torch.round(x.double() / s), self.input_info["qmin"], self.input_info["qmax"])
+
+    @staticmethod
+    def run_layer(L, x, skip=None):
+        """x, skip: tamsayı değerli float64 tensörler (cihazda). Çıkış: tamsayı değerli float64."""
+        dev = x.device
+        acc = F.conv2d(x, L["w_q"].to(dev, torch.float64), None, L["stride"], L["padding"], 1, L["groups"])
+        acc = torch.round(acc).to(torch.int64) + L["b_q"].to(dev).view(1, -1, 1, 1)
+        v = acc * L["m"].to(dev).view(1, -1, 1, 1)
+        if skip is not None:
+            v = v + skip.to(torch.int64) * L["m2"].to(dev).view(1, -1, 1, 1)
+        sh = L["sh"].to(dev).view(1, -1, 1, 1)
+        y = (v + torch.bitwise_left_shift(torch.ones_like(sh), sh - 1)) >> sh
+        return torch.clamp(y, L["qmin"], L["qmax"]).double(), acc
+
+    @torch.no_grad()
+    def forward_int(self, xq, record_acc=None):
+        """Gövdeyi tamsayı olarak çalıştır. record_acc: {katman_no: en büyük |acc|} sözlüğü (isteğe bağlı)."""
+        need = {L["skip_tensor"] for L in self.layers if L["skip_tensor"]}  # yalnızca kısayol olarak gerekenleri tut
+        tensors = {"input": xq} if "input" in need else {}
+        cur = xq
+        for L in self.layers:
+            skip = tensors.pop(L["skip_tensor"]) if L["skip_tensor"] else None
+            cur, acc = self.run_layer(L, cur, skip)
+            if L["out_tensor"] in need:
+                tensors[L["out_tensor"]] = cur
+            if record_acc is not None:
+                a = int(acc.abs().max())
+                record_acc[L["index"]] = max(record_acc.get(L["index"], 0), a)
+        return cur
+
+    @torch.no_grad()
+    def forward(self, x):
+        q = self.forward_int(self.quantize_input(x))
+        feat = (q * self.out_info["scale"].to(q.device)).float()   # ARM: tamsayı -> float
+        return self.head_model.forward_head(feat)
+
+
+def load_fakequant(folded, calib):
+    """Kalibrasyon dosyasındaki ölçeklerle fake-quant modeli kur (karşılaştırma için)."""
+    cal = _load_calib(calib) if isinstance(calib, str) else calib
+    qm = copy.deepcopy(folded)
+    quantize_weights(qm)
+    qs, _ = attach_act_quantizers(qm, fuse_add=cal.get("fuse_add", False))
+    for n, q in qs.items():
+        q.per_channel = cal.get("act_per_channel", {}).get(n, False)
+        q.set_bits(cal.get("act_bits", {}).get(n, 8))
+        q.set_unsigned(cal["act_unsigned"][n])
+        s = cal["act_scales"][n]
+        q.scale = s.to(next(qm.parameters()).device) if torch.is_tensor(s) else s
+        q.mode = "quant"
+    return qm, qs
