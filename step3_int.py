@@ -49,6 +49,9 @@ def main():
     fq, _ = load_fakequant(folded, args.calib)
     fq = fq.to(device).eval()
     L = im.layers
+    adj = [(l["conv_name"], l["n_scale_adjusted"]) for l in L if l["n_scale_adjusted"]]
+    if adj:
+        print("Ağırlık ölçeği alt sınıra çekilen ('ölü') kanallar: " + ", ".join(f"{n}: {k}" for n, k in adj))
     print(f"Cihaz: {device} | tamsayı katman: {len(L)} | residual: {sum(l['skip_tensor'] is not None for l in L)}"
           f" | 16 bit tensör: {[l['out_tensor'] for l in L if l['out_bits'] == 16] or 'yok'}")
 

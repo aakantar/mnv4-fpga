@@ -287,6 +287,7 @@ def choose_scales(quantizers, method, percentile=99.99):
 # =====================================================================
 
 MBITS = 15
+BIAS_BITS = 24   # bias (işaretli) bit genişliği üst sınırı
 
 
 def quantize_multiplier(M, mbits=MBITS):
@@ -348,8 +349,16 @@ class IntModel(nn.Module):
             if s_in.numel() > 1 and not depthwise:
                 raise NotImplementedError(f"{conv_name}: kanal başına giriş ölçeği yalnızca depthwise için")
             s_w = w.abs().amax(dim=(1, 2, 3)).clamp(min=1e-12) / QMAX_W
+            # Alt sınırlar ("ölü" kanallar için): ağırlıkları ~0, bias'ı sıfır olmayan kanallarda
+            # ölçek aşırı küçülür ve bias INT32'yi taşar. Ölçeği, bias BIAS_BITS bite sığacak ve
+            # katmanın en büyük ölçeğinin 2^-16'sından küçük olmayacak şekilde büyüt.
+            s_in_c = s_in if s_in.numel() == 1 else s_in.view(-1)
+            s_w_floor = torch.maximum(b.abs() / (s_in_c * (2 ** (BIAS_BITS - 1) - 1)),
+                                      s_w.max() * 2.0 ** -16 * torch.ones_like(s_w))
+            n_adj = int((s_w < s_w_floor).sum())
+            s_w = torch.maximum(s_w, s_w_floor)
             w_q = torch.clamp(torch.round(w / s_w.view(-1, 1, 1, 1)), -QMAX_W, QMAX_W)
-            s_acc = s_in * s_w if s_in.numel() == 1 else s_in.view(-1) * s_w
+            s_acc = s_in_c * s_w
             b_q = torch.round(b / s_acc)
             out = tensor_info(out_name)
             m, sh = quantize_multiplier(s_acc / out["scale"])
@@ -361,8 +370,8 @@ class IntModel(nn.Module):
                 if (m2_lshift < 0).any():
                     raise ValueError(f"{conv_name}: kısayol kaydırması negatif")
                 m2 = torch.bitwise_left_shift(m2_mant, m2_lshift)
-            if b_q.abs().max() >= 2 ** 31:
-                raise OverflowError(f"{conv_name}: bias INT32'ye sığmıyor")
+            if b_q.abs().max() >= 2 ** (BIAS_BITS - 1):
+                raise OverflowError(f"{conv_name}: bias {BIAS_BITS} bite sığmıyor")
             layers.append(dict(
                 index=len(layers) + 1, block=block, role=role, conv_name=conv_name,
                 in_tensor=cur["name"], out_tensor=out_name,
@@ -372,7 +381,7 @@ class IntModel(nn.Module):
                 in_bits=cur["bits"], in_unsigned=cur["unsigned"],
                 out_bits=out["bits"], out_unsigned=out["unsigned"], qmin=out["qmin"], qmax=out["qmax"],
                 w_q=w_q.to(torch.int8), b_q=b_q.to(torch.int64), m=m, sh=sh, m2=m2,
-                m2_mant=m2_mant, m2_lshift=m2_lshift,
+                m2_mant=m2_mant, m2_lshift=m2_lshift, n_scale_adjusted=n_adj,
                 s_in=s_in, s_w=s_w, s_out=out["scale"],
             ))
             cur = out
