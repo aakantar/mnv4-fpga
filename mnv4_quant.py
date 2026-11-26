@@ -120,14 +120,18 @@ class ActQuantizer:
     mode: 'off' (dokunma), 'max' (en büyük |x|'i bul), 'hist' (histogram topla), 'quant' (nicemle)"""
     NBINS = 2048
 
-    def __init__(self, name, unsigned=False, bits=8):
-        self.name, self.unsigned, self.bits = name, unsigned, bits
-        self.qmin = 0 if unsigned else -(2 ** (bits - 1))
-        self.qmax = 2 ** bits - 1 if unsigned else 2 ** (bits - 1) - 1
+    def __init__(self, name, unsigned=False, bits=8, is_relu=False):
+        self.name, self.bits, self.is_relu = name, bits, is_relu
+        self.set_unsigned(unsigned)
         self.mode = "off"
         self.absmax = 0.0
         self.hist = None
         self.scale = None
+
+    def set_unsigned(self, unsigned):
+        self.unsigned = unsigned
+        self.qmin = 0 if unsigned else -(2 ** (self.bits - 1))
+        self.qmax = 2 ** self.bits - 1 if unsigned else 2 ** (self.bits - 1) - 1
 
     def __call__(self, x):
         if self.mode == "max":
@@ -142,7 +146,10 @@ class ActQuantizer:
         return x
 
     def choose_scale(self, method, percentile=99.99):
-        """Kırpma eşiği T'yi seç, ölçek = T / qmax."""
+        """Kırpma eşiği T'yi seç, ölçek = T / qmax.
+        method: 'max', 'mse', 'percentile' ya da 'p99.9' gibi doğrudan yüzdelik."""
+        if method.startswith("p") and method != "percentile":
+            method, percentile = "percentile", float(method[1:])
         M = self.absmax if self.absmax > 0 else 1e-8
         if method == "max" or self.hist is None:
             T = M
@@ -183,7 +190,7 @@ def attach_act_quantizers(model, relu_unsigned=False, bits=8):
     for name, mod in model.named_modules():
         if isinstance(mod, ActOnly) and name != "norm_head":
             is_relu = isinstance(mod.act, nn.ReLU)
-            q = ActQuantizer(name, unsigned=(relu_unsigned and is_relu), bits=bits)
+            q = ActQuantizer(name, unsigned=(relu_unsigned and is_relu), bits=bits, is_relu=is_relu)
             qs[name] = q
             handles.append(mod.register_forward_hook(lambda m, a, out, q=q: q(out)))
 
@@ -194,6 +201,13 @@ def attach_act_quantizers(model, relu_unsigned=False, bits=8):
             qs[name + ".add"] = q
             handles.append(mod.register_forward_hook(lambda m, a, out, q=q: q(out)))
     return qs, handles
+
+
+def set_relu_unsigned(quantizers, flag):
+    """ReLU çıkışlarını işaretsiz [0,255] (True) ya da işaretli [-128,127] (False) nicemle."""
+    for q in quantizers.values():
+        if q.is_relu:
+            q.set_unsigned(flag)
 
 
 def set_mode(quantizers, mode):
