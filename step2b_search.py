@@ -78,6 +78,23 @@ def score(model, X, Y, ref):
     return top1, agree, sqnr
 
 
+def global_search(qs, qmodel, X, Y, ref):
+    print("A) Global yöntemler")
+    print(f"   {'ReLU sonrası':12s} {'yöntem':9s} {'top-1':>7s} {'float ile aynı':>15s} {'SQNR':>7s}")
+    best_cfg, best_sqnr = None, -1e9
+    for uns in (False, True):
+        set_relu_unsigned(qs, uns)
+        for m in CANDIDATES:
+            apply_methods(qs, m)
+            set_mode(qs, "quant")
+            t1, ag, sq = score(qmodel, X, Y, ref)
+            set_mode(qs, "off")
+            print(f"   {'işaretsiz' if uns else 'işaretli':12s} {m:9s} {t1:6.2f}% {ag:14.2f}% {sq:6.2f}")
+            if sq > best_sqnr:
+                best_cfg, best_sqnr = (uns, m), sq
+    return best_cfg
+
+
 def apply_methods(qs, methods):
     """methods: tek bir yöntem adı (hepsine) ya da {tensör: yöntem} sözlüğü."""
     for n, q in qs.items():
@@ -94,6 +111,14 @@ def main():
     p.add_argument("--weights", default=None)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--skip-full", action="store_true")
+    p.add_argument("--fuse-add", action="store_true",
+                   help="Residual toplamayı akümülatörde yap (pw_proj çıkışı ayrıca nicemlenmez)")
+    p.add_argument("--int16", nargs="*", default=[],
+                   help="16 bit tutulacak nicemleme noktaları, ör. blocks.2.5.add")
+    p.add_argument("--global-method", default=None,
+                   help="Verilirse A bölümü atlanır, bu yöntem kullanılır (ör. p99.99)")
+    p.add_argument("--relu-unsigned", action="store_true",
+                   help="--global-method ile birlikte: ReLU sonrası işaretsiz")
     p.add_argument("--out", default="mnv4s_int8_calib.pt")
     args = p.parse_args()
 
@@ -106,8 +131,14 @@ def main():
     folded = folded.to(device).eval()
     qmodel = copy.deepcopy(folded)
     w_scales = quantize_weights(qmodel)
-    qs, _ = attach_act_quantizers(qmodel)
+    qs, _ = attach_act_quantizers(qmodel, fuse_add=args.fuse_add)
+    for n in args.int16:
+        if n not in qs:
+            raise SystemExit(f"--int16: '{n}' adında nicemleme noktası yok")
+        qs[n].set_bits(16)
     names = list(qs)
+    print(f"Nicemleme noktası: {len(qs)} | residual akümülatörde: {'evet' if args.fuse_add else 'hayır'}"
+          f" | 16 bit: {args.int16 if args.int16 else 'yok'}")
 
     tf = create_transform(input_size=(3, 224, 224), is_training=False,
                           interpolation=cfg["interpolation"], mean=cfg["mean"],
@@ -127,19 +158,12 @@ def main():
     print("(SQNR: nicemli çıktının float çıktıya benzerliği, dB; yüksek = iyi)\n")
 
     # ---- A) Global yapılandırmalar
-    print("A) Global yöntemler")
-    print(f"   {'ReLU sonrası':12s} {'yöntem':9s} {'top-1':>7s} {'float ile aynı':>15s} {'SQNR':>7s}")
-    best_cfg, best_sqnr = None, -1e9
-    for uns in (False, True):
-        set_relu_unsigned(qs, uns)
-        for m in CANDIDATES:
-            apply_methods(qs, m)
-            set_mode(qs, "quant")
-            t1, ag, sq = score(qmodel, X, Y, ref)
-            set_mode(qs, "off")
-            print(f"   {'işaretsiz' if uns else 'işaretli':12s} {m:9s} {t1:6.2f}% {ag:14.2f}% {sq:6.2f}")
-            if sq > best_sqnr:
-                best_cfg, best_sqnr = (uns, m), sq
+    if args.global_method:
+        best_cfg = (args.relu_unsigned, args.global_method)
+        print(f"A) atlandı: ReLU sonrası {'işaretsiz' if args.relu_unsigned else 'işaretli'}, "
+              f"yöntem {args.global_method}")
+    else:
+        best_cfg = global_search(qs, qmodel, X, Y, ref)
     uns, gm = best_cfg
     set_relu_unsigned(qs, uns)
     print(f"   En iyi global: ReLU sonrası {'işaretsiz' if uns else 'işaretli'}, yöntem {gm}\n")
@@ -205,6 +229,8 @@ def main():
     apply_methods(qs, methods)
     torch.save(dict(
         method="per-tensor", methods=methods, relu_unsigned=uns, bits=8,
+        fuse_add=args.fuse_add, int16=list(args.int16),
+        act_bits={n: q.bits for n, q in qs.items()},
         act_scales={n: q.scale for n, q in qs.items()},
         act_absmax={n: q.absmax for n, q in qs.items()},
         act_unsigned={n: q.unsigned for n, q in qs.items()},

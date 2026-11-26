@@ -128,6 +128,10 @@ class ActQuantizer:
         self.hist = None
         self.scale = None
 
+    def set_bits(self, bits):
+        self.bits = bits
+        self.set_unsigned(self.unsigned)
+
     def set_unsigned(self, unsigned):
         self.unsigned = unsigned
         self.qmin = 0 if unsigned else -(2 ** (self.bits - 1))
@@ -176,10 +180,15 @@ class ActQuantizer:
         return self.scale
 
 
-def attach_act_quantizers(model, relu_unsigned=False, bits=8):
+def attach_act_quantizers(model, relu_unsigned=False, bits=8, fuse_add=False):
     """Gömülmüş (fold_bn) modele aktivasyon nicemleyicilerini kancalarla bağla.
+    fuse_add=True: residual bloklarda pw_proj çıkışı ayrıca nicemlenmez; kısayol
+    32 bit akümülatöre eklenir ve yalnızca toplam nicemlenir (donanımda tek requantization).
     Döndürür: (isim -> ActQuantizer sözlüğü, kanca tutamaçları)"""
     qs, handles = {}, []
+    skip_proj = set()
+    if fuse_add:
+        skip_proj = {f"{n}.pw_proj.bn" for n, m in model.named_modules() if getattr(m, "has_skip", False)}
 
     # 1) Model girişi (normalize edilmiş görüntü)
     q_in = ActQuantizer("input", unsigned=False, bits=bits)
@@ -188,7 +197,7 @@ def attach_act_quantizers(model, relu_unsigned=False, bits=8):
 
     # 2) Her gövde konvolüsyonunun çıkışı (ActOnly = BN'in yerine geçen aktivasyon)
     for name, mod in model.named_modules():
-        if isinstance(mod, ActOnly) and name != "norm_head":
+        if isinstance(mod, ActOnly) and name != "norm_head" and name not in skip_proj:
             is_relu = isinstance(mod.act, nn.ReLU)
             q = ActQuantizer(name, unsigned=(relu_unsigned and is_relu), bits=bits, is_relu=is_relu)
             qs[name] = q
